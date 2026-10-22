@@ -1,0 +1,26 @@
+# Dependências
+node_modules/
+
+# Build de produção
+dist/
+
+# Banco de dados local SQLite (dados de teste/produção local)
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs e variáveis de ambiente
+*.log
+npm-debug.log*
+.env
+.env.local
+.env.*.local
+
+# Sistema Operacional / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
