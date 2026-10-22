@@ -19,8 +19,10 @@ npm-debug.log*
 .env.local
 .env.*.local
 
-# Sistema Operacional / Editor
+# Sistema Operacional / Editor / Pacotes de Release
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+*.zip
+release_notes.md

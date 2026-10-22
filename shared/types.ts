@@ -253,3 +253,92 @@ export interface FinancialReport {
   refundedAppointments: Appointment[];
   manualTransactions: ManualTransaction[];
 }
+
+// ==========================================
+// SAAS AUTHENTICATION & ADMIN PANEL TYPES
+// ==========================================
+export type UserRole = 'superadmin' | 'tenant';
+export type TenantSubscriptionStatus = 'active' | 'trial' | 'suspended';
+
+export interface AuthUser {
+  id: number;
+  name: string;
+  email: string;
+  role: UserRole;
+  tenantId: number | null;
+  tenantName?: string | null;
+  tenantStatus?: TenantSubscriptionStatus | null;
+}
+
+export interface LoginResponse {
+  token: string;
+  user: AuthUser;
+}
+
+export interface SaasTenantMetrics {
+  appointmentsTotal: number;
+  completedAppointments: number;
+  clientsCount: number;
+  professionalsCount: number;
+  servicesCount: number;
+  productsCount: number;
+  grossRevenueProcessed: number;
+  lastAppointmentDate: string | null;
+}
+
+export interface SaasTenant {
+  id: number;
+  name: string;
+  ownerName: string;
+  email: string;
+  phone: string;
+  document: string;
+  businessType: string;
+  planName: string;
+  monthlyFee: number;
+  dueDay: number;
+  status: TenantSubscriptionStatus;
+  notes: string;
+  createdAt: string;
+  lastLoginAt: string | null;
+  metrics: SaasTenantMetrics;
+}
+
+export interface SaasPayment {
+  id: number;
+  tenantId: number;
+  tenantName: string;
+  ownerName: string;
+  referenceMonth: string; // YYYY-MM
+  amount: number;
+  dueDate: string; // YYYY-MM-DD
+  paidAt: string | null; // YYYY-MM-DD
+  status: 'paid' | 'pending' | 'overdue';
+  paymentMethod: string;
+  notes: string;
+  createdAt: string;
+}
+
+export interface SaasAdminOverview {
+  summary: {
+    totalTenants: number;
+    activeTenants: number;
+    suspendedTenants: number;
+    mrr: number;
+    receivedThisMonth: number;
+    pendingPaymentsTotal: number;
+    totalPlatformAppointments: number;
+    totalPlatformClients: number;
+  };
+  tenants: SaasTenant[];
+  payments: SaasPayment[];
+  adminStaff: {
+    id: number;
+    name: string;
+    email: string;
+    role: string;
+    active: boolean;
+    createdAt: string;
+    lastLoginAt: string | null;
+  }[];
+}

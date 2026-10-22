@@ -1,6 +1,24 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
+
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+export function verifyPassword(password: string, storedHash: string): boolean {
+  const [salt, key] = (storedHash || '').split(':');
+  if (!salt || !key) return false;
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(key, 'hex'), Buffer.from(derived, 'hex'));
+}
+
+export function generateSessionToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
 
 const dataDir = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(dataDir)) {
@@ -275,6 +293,136 @@ export function initDatabase() {
     db.exec("ALTER TABLE payable_accounts ADD COLUMN refunded_at TEXT");
   }
 
+  // ==========================================
+  // MULTI-TENANT SAAS & AUTHENTICATION MIGRATIONS
+  // ==========================================
+  // 1. Remove CHECK (id = 1) from company_settings if present so multiple tenants can have settings
+  const csMeta = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='company_settings'")
+    .get() as { sql?: string } | undefined;
+  if (csMeta?.sql && csMeta.sql.includes('CHECK (id = 1)')) {
+    db.exec(`
+      CREATE TABLE company_settings_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id INTEGER NOT NULL DEFAULT 1,
+        name TEXT NOT NULL,
+        subtitle TEXT NOT NULL DEFAULT '',
+        business_type TEXT NOT NULL DEFAULT 'hybrid',
+        phone TEXT NOT NULL DEFAULT '',
+        address TEXT NOT NULL DEFAULT '',
+        accent_color TEXT NOT NULL DEFAULT '#9E5A3C',
+        open_time TEXT NOT NULL DEFAULT '08:00',
+        close_time TEXT NOT NULL DEFAULT '20:00',
+        slot_interval_minutes INTEGER NOT NULL DEFAULT 30,
+        completed_display_mode TEXT NOT NULL DEFAULT 'dimmed_strikethrough',
+        debit_card_fee_percent REAL NOT NULL DEFAULT 1.49,
+        credit_card_fee_percent REAL NOT NULL DEFAULT 3.99,
+        whatsapp_template_reminder TEXT NOT NULL,
+        whatsapp_template_receipt TEXT NOT NULL,
+        sms_template_reminder TEXT NOT NULL,
+        webhook_url TEXT NOT NULL DEFAULT ''
+      );
+      INSERT INTO company_settings_new (
+        id, tenant_id, name, subtitle, business_type, phone, address, accent_color,
+        open_time, close_time, slot_interval_minutes, completed_display_mode,
+        debit_card_fee_percent, credit_card_fee_percent,
+        whatsapp_template_reminder, whatsapp_template_receipt, sms_template_reminder, webhook_url
+      )
+      SELECT
+        id, 1, name, subtitle, business_type, phone, address, accent_color,
+        open_time, close_time, slot_interval_minutes,
+        COALESCE(completed_display_mode, 'dimmed_strikethrough'),
+        COALESCE(debit_card_fee_percent, 1.49),
+        COALESCE(credit_card_fee_percent, 3.99),
+        whatsapp_template_reminder, whatsapp_template_receipt, sms_template_reminder, webhook_url
+      FROM company_settings;
+      DROP TABLE company_settings;
+      ALTER TABLE company_settings_new RENAME TO company_settings;
+    `);
+  } else {
+    const csColsNow = db.prepare("PRAGMA table_info('company_settings')").all() as any[];
+    if (!csColsNow.some((c) => c.name === 'tenant_id')) {
+      db.exec("ALTER TABLE company_settings ADD COLUMN tenant_id INTEGER NOT NULL DEFAULT 1");
+    }
+  }
+
+  // 2. Add tenant_id column to all operational tables so each salon/barbershop is isolated
+  const tenantScopedTables = [
+    'professionals',
+    'services',
+    'clients',
+    'products',
+    'appointments',
+    'notification_logs',
+    'manual_transactions',
+    'payable_accounts',
+  ];
+  for (const tbl of tenantScopedTables) {
+    const cols = db.prepare(`PRAGMA table_info('${tbl}')`).all() as any[];
+    if (!cols.some((c) => c.name === 'tenant_id')) {
+      db.exec(`ALTER TABLE ${tbl} ADD COLUMN tenant_id INTEGER NOT NULL DEFAULT 1`);
+    }
+  }
+
+  // 3. Create SaaS Tenants, Users, Auth Sessions, and SaaS Subscription Payments tables
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS saas_tenants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      owner_name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      phone TEXT NOT NULL DEFAULT '',
+      document TEXT NOT NULL DEFAULT '',
+      business_type TEXT NOT NULL DEFAULT 'salon',
+      plan_name TEXT NOT NULL DEFAULT 'Plano Profissional',
+      monthly_fee REAL NOT NULL DEFAULT 99.90,
+      due_day INTEGER NOT NULL DEFAULT 10,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'trial', 'suspended')),
+      notes TEXT NOT NULL DEFAULT '',
+      last_login_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('superadmin', 'tenant')),
+      tenant_id INTEGER,
+      active INTEGER NOT NULL DEFAULT 1,
+      last_login_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS saas_payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      reference_month TEXT NOT NULL,
+      due_date TEXT NOT NULL,
+      paid_at TEXT,
+      payment_method TEXT NOT NULL DEFAULT 'pix',
+      status TEXT NOT NULL DEFAULT 'paid' CHECK (status IN ('paid', 'pending', 'overdue')),
+      notes TEXT NOT NULL DEFAULT '',
+      recorded_by_name TEXT NOT NULL DEFAULT 'Administrador',
+      created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+      FOREIGN KEY (tenant_id) REFERENCES saas_tenants(id) ON DELETE CASCADE
+    );
+  `);
+
+  const stCols = db.prepare("PRAGMA table_info('saas_tenants')").all() as any[];
+  if (!stCols.some((c) => c.name === 'document')) {
+    db.exec("ALTER TABLE saas_tenants ADD COLUMN document TEXT NOT NULL DEFAULT ''");
+  }
+
   // Seed initial sample payable accounts if empty so user can test overdue & upcoming alerts immediately
   const payablesCount = db.prepare('SELECT COUNT(*) as cnt FROM payable_accounts').get() as { cnt: number };
   if (payablesCount.cnt === 0) {
@@ -332,6 +480,128 @@ export function initDatabase() {
       SELECT 1 FROM appointment_services aps WHERE aps.appointment_id = a.id
     );
   `);
+
+  // Seed default SaaS Admin & Salon/Barbershop Tenant Accounts if empty
+  const usersCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+  if (usersCount.cnt === 0) {
+    const defaultPwdHash = hashPassword('123456');
+    const today = getTodayStr();
+    const curMonth = today.slice(0, 7);
+
+    // 1. Ensure Tenant #1 exists in saas_tenants matching existing company_settings #1
+    const stg1 = db.prepare('SELECT * FROM company_settings WHERE tenant_id = 1 OR id = 1 LIMIT 1').get() as any;
+    const t1Name = stg1?.name || 'Atelier Nobre — Salão & Barbearia';
+    const t1Type = stg1?.business_type || 'hybrid';
+    const t1Phone = stg1?.phone || '(11) 99876-5432';
+
+    db.prepare(`
+      INSERT INTO saas_tenants (
+        id, name, owner_name, email, phone, business_type, plan_name, monthly_fee, due_day, status, notes, last_login_at
+      ) VALUES (1, ?, 'Camila Fontes', 'contato@ateliernobre.com', ?, ?, 'Plano Pro Ilimitado', 149.90, 10, 'active', 'Cliente fundador · Unidade Jardins', datetime('now', 'localtime'))
+    `).run(t1Name, t1Phone, t1Type);
+
+    // 2. Create a second sample Tenant #2 (Barbearia) so Admin Panel shows multi-client metrics
+    db.prepare(`
+      INSERT INTO saas_tenants (
+        id, name, owner_name, email, phone, business_type, plan_name, monthly_fee, due_day, status, notes, last_login_at
+      ) VALUES (2, 'Barbearia Dom Pedro — Club & Navalha', 'Rafael Mendes', 'contato@barbeariadompedro.com', '(11) 98811-2233', 'barbershop', 'Plano Essencial', 99.90, 15, 'active', 'Barbearia com 3 cadeiras', datetime('now', '-1 day', 'localtime'))
+    `).run();
+
+    ensureTenantWorkspace(2, 'Barbearia Dom Pedro — Club & Navalha', 'barbershop', '(11) 98811-2233', 'Rafael Mendes');
+
+    // 3. Create Super Admin + Tenant Users
+    db.prepare(`
+      INSERT INTO users (name, email, password_hash, role, tenant_id, active)
+      VALUES
+        ('Max (Administrador SaaS)', 'admin@agendahair.com', ?, 'superadmin', NULL, 1),
+        ('Camila Fontes (Salão)', 'contato@ateliernobre.com', ?, 'tenant', 1, 1),
+        ('Rafael Mendes (Barbearia)', 'contato@barbeariadompedro.com', ?, 'tenant', 2, 1)
+    `).run(defaultPwdHash, defaultPwdHash, defaultPwdHash);
+
+    // 4. Seed sample SaaS subscription payments
+    db.prepare(`
+      INSERT INTO saas_payments (
+        tenant_id, amount, reference_month, due_date, paid_at, payment_method, status, notes, recorded_by_name
+      ) VALUES
+        (1, 149.90, ?, ?, ?, 'pix', 'paid', 'Mensalidade paga via PIX', 'Max (Administrador SaaS)'),
+        (2, 99.90, ?, ?, ?, 'pix', 'paid', 'Mensalidade em dia', 'Max (Administrador SaaS)')
+    `).run(
+      curMonth,
+      `${curMonth}-10`,
+      today,
+      curMonth,
+      `${curMonth}-15`,
+      today
+    );
+  }
+}
+
+export function ensureTenantWorkspace(
+  tenantId: number,
+  name: string,
+  businessType: string,
+  phone: string,
+  ownerName: string
+) {
+  const existingStg = db
+    .prepare('SELECT id FROM company_settings WHERE tenant_id = ?')
+    .get(tenantId) as any;
+
+  if (!existingStg) {
+    const isBarber = businessType === 'barbershop';
+    db.prepare(`
+      INSERT INTO company_settings (
+        tenant_id, name, subtitle, business_type, phone, address, accent_color,
+        open_time, close_time, slot_interval_minutes, completed_display_mode,
+        debit_card_fee_percent, credit_card_fee_percent,
+        whatsapp_template_reminder, whatsapp_template_receipt, sms_template_reminder, webhook_url
+      ) VALUES (?, ?, ?, ?, ?, '', ?, '08:00', '20:00', 30, 'dimmed_strikethrough', 1.49, 3.99, ?, ?, ?, '')
+    `).run(
+      tenantId,
+      name,
+      isBarber ? 'Cortes Clássicos, Barba & Navalha' : 'Alta Coiffure, Química & Tratamentos',
+      businessType || 'salon',
+      phone || '',
+      isBarber ? '#234B36' : '#9E5A3C',
+      'Olá {cliente}! Confirmamos seu horário de *{servico}* com {profissional} no *{empresa}* em *{data} às {hora}*. Até breve!',
+      'Olá {cliente}! Agradecemos sua visita ao *{empresa}*. Atendimento finalizado ({servico}) — Total pago: *{valor}*. Volte sempre!',
+      '{empresa}: Lembrete de agendamento ({servico}) em {data} as {hora}.'
+    );
+  }
+
+  const profCount = db
+    .prepare('SELECT COUNT(*) as cnt FROM professionals WHERE tenant_id = ?')
+    .get(tenantId) as { cnt: number };
+  if (profCount.cnt === 0) {
+    db.prepare(
+      'INSERT INTO professionals (tenant_id, name, role, color, active) VALUES (?, ?, ?, ?, 1)'
+    ).run(
+      tenantId,
+      ownerName || 'Profissional Principal',
+      businessType === 'barbershop' ? 'Master Barber' : 'Hair Stylist & Colorista',
+      businessType === 'barbershop' ? '#234B36' : '#9E5A3C'
+    );
+  }
+
+  const srvCount = db
+    .prepare('SELECT COUNT(*) as cnt FROM services WHERE tenant_id = ?')
+    .get(tenantId) as { cnt: number };
+  if (srvCount.cnt === 0) {
+    const insertSrv = db.prepare(`
+      INSERT INTO services (
+        tenant_id, name, category, duration_minutes, price_type, base_price, max_price, allows_fit_in_window, description, active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `);
+    if (businessType === 'barbershop') {
+      insertSrv.run(tenantId, 'Corte Degradê / Tesoura', 'Barbearia', 45, 'fixed', 55, null, 0, 'Corte masculino completo');
+      insertSrv.run(tenantId, 'Barba Terapia com Toalha Quente', 'Barbearia', 30, 'fixed', 40, null, 0, 'Modelagem com navalha');
+      insertSrv.run(tenantId, 'Progressiva / Alisamento Masculino', 'Química', 90, 'variable', 90, 140, 1, 'Permite encaixe na pausa');
+    } else {
+      insertSrv.run(tenantId, 'Corte Feminino & Visagismo', 'Cabelo', 45, 'fixed', 95, null, 0, 'Lavagem + corte + finalização');
+      insertSrv.run(tenantId, 'Escova Progressiva Orgânica', 'Química & Alisamento', 180, 'variable', 240, 420, 1, 'Pausa de 50 min permite encaixar corte');
+      insertSrv.run(tenantId, 'Mechas & Iluminação', 'Coloração', 210, 'variable', 320, 580, 1, 'Permite encaixe durante pausa');
+    }
+  }
 }
 
 function seedInitialData() {

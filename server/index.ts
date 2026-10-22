@@ -1,10 +1,20 @@
 import express from 'express';
 import cors from 'cors';
-import { db, initDatabase, runInTransaction, getTodayStr } from './db.ts';
+import {
+  db,
+  initDatabase,
+  runInTransaction,
+  getTodayStr,
+  hashPassword,
+  verifyPassword,
+  generateSessionToken,
+  ensureTenantWorkspace,
+} from './db.ts';
 import type {
   Appointment,
   AppointmentProductItem,
   AppointmentServiceItem,
+  AuthUser,
   Client,
   CompanySettings,
   ConflictCheckResult,
@@ -17,6 +27,9 @@ import type {
   PayableRecurrence,
   Product,
   Professional,
+  SaasAdminOverview,
+  SaasPayment,
+  SaasTenant,
   ServiceItem,
 } from '../shared/types.ts';
 
@@ -25,6 +38,151 @@ initDatabase();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ==========================================
+// 0. AUTHENTICATION & MULTI-TENANT CONTEXT
+// ==========================================
+function getAuthUserFromRequest(req: express.Request): AuthUser | null {
+  const authHeader = String(req.headers.authorization || '');
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  if (!token) return null;
+
+  const row = db
+    .prepare(`
+      SELECT
+        u.id, u.name, u.email, u.role, u.tenant_id, u.active,
+        t.name as tenant_name, t.status as tenant_status
+      FROM auth_sessions s
+      JOIN users u ON u.id = s.user_id
+      LEFT JOIN saas_tenants t ON t.id = u.tenant_id
+      WHERE s.token = ?
+    `)
+    .get(token) as any;
+
+  if (!row || !row.active) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    tenantId: row.tenant_id ?? null,
+    tenantName: row.tenant_name ?? null,
+    tenantStatus: row.tenant_status ?? null,
+  };
+}
+
+function getTenantId(req: express.Request): number {
+  const user = getAuthUserFromRequest(req);
+  if (user) {
+    // Allow SuperAdmin to inspect/support a specific tenant's panel via x-tenant-id header
+    if (user.role === 'superadmin') {
+      const imp = Number(req.headers['x-tenant-id']);
+      return imp > 0 ? imp : 1;
+    }
+    if (user.tenantId) return user.tenantId;
+  }
+  return 1;
+}
+
+app.post('/api/auth/login', (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Informe seu e-mail e senha de acesso.' });
+  }
+
+  const row = db
+    .prepare(`
+      SELECT
+        u.*,
+        t.name as tenant_name,
+        t.status as tenant_status
+      FROM users u
+      LEFT JOIN saas_tenants t ON t.id = u.tenant_id
+      WHERE LOWER(u.email) = ?
+    `)
+    .get(email) as any;
+
+  if (!row || !verifyPassword(password, row.password_hash)) {
+    return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+  }
+
+  if (!row.active) {
+    return res.status(403).json({ error: 'Este usuário está desativado. Contate o administrador.' });
+  }
+
+  if (row.role === 'tenant' && row.tenant_status === 'suspended') {
+    return res.status(403).json({
+      error:
+        'O acesso deste estabelecimento está temporariamente suspenso. Entre em contato com a administração para regularizar sua assinatura.',
+    });
+  }
+
+  const token = generateSessionToken();
+  runInTransaction(() => {
+    db.prepare('INSERT INTO auth_sessions (token, user_id) VALUES (?, ?)').run(token, row.id);
+    db.prepare("UPDATE users SET last_login_at = datetime('now', 'localtime') WHERE id = ?").run(
+      row.id
+    );
+    if (row.tenant_id) {
+      db.prepare(
+        "UPDATE saas_tenants SET last_login_at = datetime('now', 'localtime') WHERE id = ?"
+      ).run(row.tenant_id);
+    }
+  });
+
+  const user: AuthUser = {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    tenantId: row.tenant_id ?? null,
+    tenantName: row.tenant_name ?? null,
+    tenantStatus: row.tenant_status ?? null,
+  };
+
+  res.json({ token, user });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const user = getAuthUserFromRequest(req);
+  if (!user) return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  if (user.role === 'tenant' && user.tenantStatus === 'suspended') {
+    return res.status(403).json({ error: 'Estabelecimento com assinatura suspensa.' });
+  }
+  res.json({ user });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const authHeader = String(req.headers.authorization || '');
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  if (token) {
+    db.prepare('DELETE FROM auth_sessions WHERE token = ?').run(token);
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/change-password', (req, res) => {
+  const user = getAuthUserFromRequest(req);
+  if (!user) return res.status(401).json({ error: 'Não autenticado.' });
+
+  const { currentPassword, newPassword } = req.body;
+  if (!newPassword || String(newPassword).length < 4) {
+    return res.status(400).json({ error: 'A nova senha deve ter pelo menos 4 caracteres.' });
+  }
+
+  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id) as any;
+  if (currentPassword && !verifyPassword(String(currentPassword), row.password_hash)) {
+    return res.status(400).json({ error: 'A senha atual informada está incorreta.' });
+  }
+
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(
+    hashPassword(String(newPassword)),
+    user.id
+  );
+  res.json({ ok: true });
+});
 
 // Helpers for time math
 function timeToMinutes(t: string): number {
@@ -39,10 +197,12 @@ function minutesToTime(totalMin: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-function getCardFeeRates(): { debitPercent: number; creditPercent: number } {
+function getCardFeeRates(tenantId = 1): { debitPercent: number; creditPercent: number } {
   const row = db
-    .prepare('SELECT debit_card_fee_percent, credit_card_fee_percent FROM company_settings WHERE id = 1')
-    .get() as any;
+    .prepare(
+      'SELECT debit_card_fee_percent, credit_card_fee_percent FROM company_settings WHERE tenant_id = ? LIMIT 1'
+    )
+    .get(tenantId) as any;
   return {
     debitPercent: Number(row?.debit_card_fee_percent ?? 1.49),
     creditPercent: Number(row?.credit_card_fee_percent ?? 3.99),
@@ -65,11 +225,11 @@ function computeCardFeeForPayment(
   return { feePercent, feeAmount, netAmount };
 }
 
-function hydrateAppointments(rows: any[]): Appointment[] {
+function hydrateAppointments(rows: any[], tenantId = 1): Appointment[] {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
   const placeholders = ids.map(() => '?').join(',');
-  const rates = getCardFeeRates();
+  const rates = getCardFeeRates(tenantId);
 
   const srvRows = db
     .prepare(
@@ -180,8 +340,17 @@ function hydrateAppointments(rows: any[]): Appointment[] {
 // ==========================================
 // 1. COMPANY SETTINGS & CUSTOMIZATION
 // ==========================================
-app.get('/api/settings', (_req, res) => {
-  const row = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as any;
+app.get('/api/settings', (req, res) => {
+  const tenantId = getTenantId(req);
+  let row = db
+    .prepare('SELECT * FROM company_settings WHERE tenant_id = ? LIMIT 1')
+    .get(tenantId) as any;
+  if (!row) {
+    ensureTenantWorkspace(tenantId, 'Meu Salão & Barbearia', 'salon', '', 'Profissional');
+    row = db
+      .prepare('SELECT * FROM company_settings WHERE tenant_id = ? LIMIT 1')
+      .get(tenantId) as any;
+  }
   const settings: CompanySettings = {
     id: row.id,
     name: row.name,
@@ -205,6 +374,7 @@ app.get('/api/settings', (_req, res) => {
 });
 
 app.put('/api/settings', (req, res) => {
+  const tenantId = getTenantId(req);
   const b = req.body as Partial<CompanySettings>;
   db.prepare(`
     UPDATE company_settings SET
@@ -224,7 +394,7 @@ app.put('/api/settings', (req, res) => {
       whatsapp_template_receipt = COALESCE(?, whatsapp_template_receipt),
       sms_template_reminder = COALESCE(?, sms_template_reminder),
       webhook_url = COALESCE(?, webhook_url)
-    WHERE id = 1
+    WHERE tenant_id = ?
   `).run(
     b.name ?? null,
     b.subtitle ?? null,
@@ -241,10 +411,22 @@ app.put('/api/settings', (req, res) => {
     b.whatsappTemplateReminder ?? null,
     b.whatsappTemplateReceipt ?? null,
     b.smsTemplateReminder ?? null,
-    b.webhookUrl ?? null
+    b.webhookUrl ?? null,
+    tenantId
   );
 
-  const updated = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as any;
+  if (b.name) {
+    db.prepare('UPDATE saas_tenants SET name = ?, business_type = COALESCE(?, business_type), phone = COALESCE(?, phone) WHERE id = ?').run(
+      b.name,
+      b.businessType ?? null,
+      b.phone ?? null,
+      tenantId
+    );
+  }
+
+  const updated = db
+    .prepare('SELECT * FROM company_settings WHERE tenant_id = ? LIMIT 1')
+    .get(tenantId) as any;
   res.json({
     id: updated.id,
     name: updated.name,
@@ -269,8 +451,11 @@ app.put('/api/settings', (req, res) => {
 // ==========================================
 // 2. PROFESSIONALS
 // ==========================================
-app.get('/api/professionals', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM professionals WHERE active = 1 ORDER BY id ASC').all() as any[];
+app.get('/api/professionals', (req, res) => {
+  const tenantId = getTenantId(req);
+  const rows = db
+    .prepare('SELECT * FROM professionals WHERE tenant_id = ? AND active = 1 ORDER BY id ASC')
+    .all(tenantId) as any[];
   const list: Professional[] = rows.map((r) => ({
     id: r.id,
     name: r.name,
@@ -282,11 +467,14 @@ app.get('/api/professionals', (_req, res) => {
 });
 
 app.post('/api/professionals', (req, res) => {
+  const tenantId = getTenantId(req);
   const { name, role, color } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Nome do profissional é obrigatório.' });
   const result = db
-    .prepare('INSERT INTO professionals (name, role, color, active) VALUES (?, ?, ?, 1)')
-    .run(name.trim(), (role || 'Especialista').trim(), color || '#9E5A3C');
+    .prepare(
+      'INSERT INTO professionals (tenant_id, name, role, color, active) VALUES (?, ?, ?, ?, 1)'
+    )
+    .run(tenantId, name.trim(), (role || 'Especialista').trim(), color || '#9E5A3C');
   res.status(201).json({
     id: Number(result.lastInsertRowid),
     name: name.trim(),
@@ -297,6 +485,7 @@ app.post('/api/professionals', (req, res) => {
 });
 
 app.put('/api/professionals/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const { name, role, color, active } = req.body;
   db.prepare(`
@@ -305,22 +494,38 @@ app.put('/api/professionals/:id', (req, res) => {
       role = COALESCE(?, role),
       color = COALESCE(?, color),
       active = COALESCE(?, active)
-    WHERE id = ?
-  `).run(name ?? null, role ?? null, color ?? null, active !== undefined ? (active ? 1 : 0) : null, id);
+    WHERE id = ? AND tenant_id = ?
+  `).run(
+    name ?? null,
+    role ?? null,
+    color ?? null,
+    active !== undefined ? (active ? 1 : 0) : null,
+    id,
+    tenantId
+  );
   res.json({ ok: true });
 });
 
 app.delete('/api/professionals/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
-  db.prepare('UPDATE professionals SET active = 0 WHERE id = ?').run(id);
+  db.prepare('UPDATE professionals SET active = 0 WHERE id = ? AND tenant_id = ?').run(
+    id,
+    tenantId
+  );
   res.json({ ok: true });
 });
 
 // ==========================================
 // 3. SERVICES (FIXED & VARIABLE PRICE + DURATION)
 // ==========================================
-app.get('/api/services', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM services WHERE active = 1 ORDER BY category ASC, name ASC').all() as any[];
+app.get('/api/services', (req, res) => {
+  const tenantId = getTenantId(req);
+  const rows = db
+    .prepare(
+      'SELECT * FROM services WHERE tenant_id = ? AND active = 1 ORDER BY category ASC, name ASC'
+    )
+    .all(tenantId) as any[];
   const list: ServiceItem[] = rows.map((r) => ({
     id: r.id,
     name: r.name,
@@ -337,14 +542,16 @@ app.get('/api/services', (_req, res) => {
 });
 
 app.post('/api/services', (req, res) => {
+  const tenantId = getTenantId(req);
   const b = req.body;
   if (!b.name?.trim()) return res.status(400).json({ error: 'Nome do serviço é obrigatório.' });
   const result = db
     .prepare(`
-      INSERT INTO services (name, category, duration_minutes, price_type, base_price, max_price, allows_fit_in_window, description, active)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+      INSERT INTO services (tenant_id, name, category, duration_minutes, price_type, base_price, max_price, allows_fit_in_window, description, active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
     `)
     .run(
+      tenantId,
       b.name.trim(),
       (b.category || 'Geral').trim(),
       Number(b.durationMinutes) || 30,
@@ -359,6 +566,7 @@ app.post('/api/services', (req, res) => {
 });
 
 app.put('/api/services/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body;
   db.prepare(`
@@ -371,7 +579,7 @@ app.put('/api/services/:id', (req, res) => {
       max_price = ?,
       allows_fit_in_window = ?,
       description = ?
-    WHERE id = ?
+    WHERE id = ? AND tenant_id = ?
   `).run(
     b.name.trim(),
     (b.category || 'Geral').trim(),
@@ -381,34 +589,38 @@ app.put('/api/services/:id', (req, res) => {
     b.maxPrice ? Number(b.maxPrice) : null,
     b.allowsFitInWindow ? 1 : 0,
     (b.description || '').trim(),
-    id
+    id,
+    tenantId
   );
   res.json({ ok: true });
 });
 
 app.delete('/api/services/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
-  db.prepare('UPDATE services SET active = 0 WHERE id = ?').run(id);
+  db.prepare('UPDATE services SET active = 0 WHERE id = ? AND tenant_id = ?').run(id, tenantId);
   res.json({ ok: true });
 });
 
 // ==========================================
 // 4. CLIENTS
 // ==========================================
-app.get('/api/clients', (_req, res) => {
+app.get('/api/clients', (req, res) => {
+  const tenantId = getTenantId(req);
   const rows = db
     .prepare(`
       SELECT
         c.*,
-        COUNT(CASE WHEN a.status = 'completed' THEN 1 END) as total_visits,
-        COALESCE(SUM(CASE WHEN a.status = 'completed' THEN a.total_amount ELSE 0 END), 0) as total_spent,
-        MAX(CASE WHEN a.status = 'completed' THEN a.date END) as last_visit
+        COUNT(CASE WHEN a.status = 'completed' AND COALESCE(a.is_refunded, 0) = 0 THEN 1 END) as total_visits,
+        COALESCE(SUM(CASE WHEN a.status = 'completed' AND COALESCE(a.is_refunded, 0) = 0 THEN a.total_amount ELSE 0 END), 0) as total_spent,
+        MAX(CASE WHEN a.status = 'completed' AND COALESCE(a.is_refunded, 0) = 0 THEN a.date END) as last_visit
       FROM clients c
       LEFT JOIN appointments a ON a.client_id = c.id
+      WHERE c.tenant_id = ?
       GROUP BY c.id
       ORDER BY c.full_name ASC
     `)
-    .all() as any[];
+    .all(tenantId) as any[];
 
   const list: Client[] = rows.map((r) => ({
     id: r.id,
@@ -424,13 +636,14 @@ app.get('/api/clients', (_req, res) => {
 });
 
 app.post('/api/clients', (req, res) => {
+  const tenantId = getTenantId(req);
   const { fullName, phone, notes } = req.body;
   if (!fullName?.trim() || !phone?.trim()) {
     return res.status(400).json({ error: 'Nome completo e telefone são obrigatórios.' });
   }
   const result = db
-    .prepare('INSERT INTO clients (full_name, phone, notes) VALUES (?, ?, ?)')
-    .run(fullName.trim(), phone.trim(), (notes || '').trim());
+    .prepare('INSERT INTO clients (tenant_id, full_name, phone, notes) VALUES (?, ?, ?, ?)')
+    .run(tenantId, fullName.trim(), phone.trim(), (notes || '').trim());
 
   res.status(201).json({
     id: Number(result.lastInsertRowid),
@@ -441,22 +654,25 @@ app.post('/api/clients', (req, res) => {
 });
 
 app.put('/api/clients/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const { fullName, phone, notes } = req.body;
-  db.prepare('UPDATE clients SET full_name = ?, phone = ?, notes = ? WHERE id = ?').run(
-    fullName.trim(),
-    phone.trim(),
-    (notes || '').trim(),
-    id
-  );
+  db.prepare(
+    'UPDATE clients SET full_name = ?, phone = ?, notes = ? WHERE id = ? AND tenant_id = ?'
+  ).run(fullName.trim(), phone.trim(), (notes || '').trim(), id, tenantId);
   res.json({ ok: true });
 });
 
 // ==========================================
 // 5. PRODUCTS & INVENTORY
 // ==========================================
-app.get('/api/products', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM products WHERE active = 1 ORDER BY category ASC, name ASC').all() as any[];
+app.get('/api/products', (req, res) => {
+  const tenantId = getTenantId(req);
+  const rows = db
+    .prepare(
+      'SELECT * FROM products WHERE tenant_id = ? AND active = 1 ORDER BY category ASC, name ASC'
+    )
+    .all(tenantId) as any[];
   const list: Product[] = rows.map((r) => ({
     id: r.id,
     name: r.name,
@@ -473,14 +689,16 @@ app.get('/api/products', (_req, res) => {
 });
 
 app.post('/api/products', (req, res) => {
+  const tenantId = getTenantId(req);
   const b = req.body;
   if (!b.name?.trim()) return res.status(400).json({ error: 'Nome do produto é obrigatório.' });
   const result = db
     .prepare(`
-      INSERT INTO products (name, category, sku, price, cost_price, stock_quantity, min_stock, unit, active)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+      INSERT INTO products (tenant_id, name, category, sku, price, cost_price, stock_quantity, min_stock, unit, active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
     `)
     .run(
+      tenantId,
       b.name.trim(),
       (b.category || 'Home Care').trim(),
       (b.sku || '').trim(),
@@ -494,6 +712,7 @@ app.post('/api/products', (req, res) => {
 });
 
 app.put('/api/products/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body;
   db.prepare(`
@@ -506,7 +725,7 @@ app.put('/api/products/:id', (req, res) => {
       stock_quantity = ?,
       min_stock = ?,
       unit = ?
-    WHERE id = ?
+    WHERE id = ? AND tenant_id = ?
   `).run(
     b.name.trim(),
     (b.category || 'Home Care').trim(),
@@ -516,29 +735,37 @@ app.put('/api/products/:id', (req, res) => {
     Number(b.stockQuantity) || 0,
     Number(b.minStock) || 3,
     (b.unit || 'un').trim(),
-    id
+    id,
+    tenantId
   );
   res.json({ ok: true });
 });
 
 app.post('/api/products/:id/restock', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const delta = Number(req.body.quantity) || 0;
   const registerExpense = Boolean(req.body.registerExpense);
 
   runInTransaction(() => {
-    const prod = db.prepare('SELECT * FROM products WHERE id = ?').get(id) as any;
+    const prod = db
+      .prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?')
+      .get(id, tenantId) as any;
     if (!prod) throw new Error('Produto não encontrado');
 
     const newStock = Math.max(0, prod.stock_quantity + delta);
-    db.prepare('UPDATE products SET stock_quantity = ? WHERE id = ?').run(newStock, id);
+    db.prepare('UPDATE products SET stock_quantity = ? WHERE id = ? AND tenant_id = ?').run(
+      newStock,
+      id,
+      tenantId
+    );
 
     if (registerExpense && delta > 0 && prod.cost_price > 0) {
       const totalCost = delta * prod.cost_price;
       db.prepare(`
-        INSERT INTO manual_transactions (date, type, category, description, amount, payment_method)
-        VALUES (?, 'expense', 'Reposição de Estoque', ?, ?, 'pix')
-      `).run(getTodayStr(), `Compra de Estoque: ${delta}x ${prod.name}`, totalCost);
+        INSERT INTO manual_transactions (tenant_id, date, type, category, description, amount, payment_method)
+        VALUES (?, ?, 'expense', 'Reposição de Estoque', ?, ?, 'pix')
+      `).run(tenantId, getTodayStr(), `Compra de Estoque: ${delta}x ${prod.name}`, totalCost);
     }
   });
 
@@ -546,8 +773,9 @@ app.post('/api/products/:id/restock', (req, res) => {
 });
 
 app.delete('/api/products/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
-  db.prepare('UPDATE products SET active = 0 WHERE id = ?').run(id);
+  db.prepare('UPDATE products SET active = 0 WHERE id = ? AND tenant_id = ?').run(id, tenantId);
   res.json({ ok: true });
 });
 
@@ -555,6 +783,7 @@ app.delete('/api/products/:id', (req, res) => {
 // 6. APPOINTMENTS & ENCAIXE (OVERLAP ENGINE)
 // ==========================================
 app.get('/api/appointments/check-conflict', (req, res) => {
+  const tenantId = getTenantId(req);
   const date = String(req.query.date || '');
   const professionalId = Number(req.query.professionalId);
   const startTime = String(req.query.startTime || '');
@@ -577,13 +806,14 @@ app.get('/api/appointments/check-conflict', (req, res) => {
       FROM appointments a
       JOIN clients c ON c.id = a.client_id
       JOIN services s ON s.id = a.service_id
-      WHERE a.date = ?
+      WHERE a.tenant_id = ?
+        AND a.date = ?
         AND a.professional_id = ?
         AND a.status != 'cancelled'
         ${excludeId ? 'AND a.id != ?' : ''}
       ORDER BY a.start_time ASC
     `)
-    .all(...(excludeId ? [date, professionalId, excludeId] : [date, professionalId])) as any[];
+    .all(...(excludeId ? [tenantId, date, professionalId, excludeId] : [tenantId, date, professionalId])) as any[];
 
   const overlapping = existing.filter((row) => {
     const start = timeToMinutes(row.start_time);
@@ -608,6 +838,7 @@ app.get('/api/appointments/check-conflict', (req, res) => {
 });
 
 app.get('/api/appointments', (req, res) => {
+  const tenantId = getTenantId(req);
   const date = req.query.date ? String(req.query.date) : null;
   const professionalId = req.query.professionalId ? Number(req.query.professionalId) : null;
 
@@ -625,9 +856,9 @@ app.get('/api/appointments', (req, res) => {
     JOIN clients c ON c.id = a.client_id
     JOIN professionals p ON p.id = a.professional_id
     JOIN services s ON s.id = a.service_id
-    WHERE 1=1
+    WHERE a.tenant_id = ?
   `;
-  const params: any[] = [];
+  const params: any[] = [tenantId];
 
   if (date) {
     sql += ' AND a.date = ?';
@@ -641,11 +872,12 @@ app.get('/api/appointments', (req, res) => {
   sql += ' ORDER BY a.date DESC, a.start_time ASC, a.is_fit_in ASC';
 
   const rows = db.prepare(sql).all(...params) as any[];
-  res.json(hydrateAppointments(rows));
+  res.json(hydrateAppointments(rows, tenantId));
 });
 
 app.post('/api/appointments', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const b = req.body;
 
     // Support multiple services or single serviceId fallback
@@ -673,7 +905,9 @@ app.post('/api/appointments', (req, res) => {
     let summedServicePrice = 0;
 
     for (const item of rawServices) {
-      const srv = db.prepare('SELECT * FROM services WHERE id = ?').get(Number(item.serviceId)) as any;
+      const srv = db
+        .prepare('SELECT * FROM services WHERE id = ? AND tenant_id = ?')
+        .get(Number(item.serviceId), tenantId) as any;
       if (!srv) continue;
       const dur = item.durationMinutes !== undefined && Number(item.durationMinutes) > 0
         ? Number(item.durationMinutes)
@@ -709,9 +943,9 @@ app.post('/api/appointments', (req, res) => {
     const existingRows = db
       .prepare(`
         SELECT id, start_time, end_time FROM appointments
-        WHERE date = ? AND professional_id = ? AND status != 'cancelled'
+        WHERE tenant_id = ? AND date = ? AND professional_id = ? AND status != 'cancelled'
       `)
-      .all(b.date, Number(b.professionalId)) as any[];
+      .all(tenantId, b.date, Number(b.professionalId)) as any[];
 
     const overlaps = existingRows.filter((r) => {
       const s = timeToMinutes(r.start_time);
@@ -745,7 +979,9 @@ app.post('/api/appointments', (req, res) => {
 
       for (const item of productItems) {
         if (!item.productId || item.quantity <= 0) continue;
-        const prod = db.prepare('SELECT * FROM products WHERE id = ?').get(Number(item.productId)) as any;
+        const prod = db
+          .prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?')
+          .get(Number(item.productId), tenantId) as any;
         if (!prod) continue;
         const qty = Number(item.quantity);
         const subtotal = prod.price * qty;
@@ -766,13 +1002,14 @@ app.post('/api/appointments', (req, res) => {
       const apptResult = db
         .prepare(`
           INSERT INTO appointments (
-            date, start_time, end_time, duration_minutes,
+            tenant_id, date, start_time, end_time, duration_minutes,
             client_id, professional_id, service_id,
             service_price, products_total, discount, total_amount,
             is_fit_in, parent_appointment_id, status, payment_method, notes
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'pending', ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', 'pending', ?)
         `)
         .run(
+          tenantId,
           b.date,
           b.startTime,
           endTime,
@@ -830,11 +1067,14 @@ app.post('/api/appointments', (req, res) => {
 // Update appointment details + multiple services + products (before or during service)
 app.put('/api/appointments/:id', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const b = req.body;
 
     runInTransaction(() => {
-      const existing = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any;
+      const existing = db
+        .prepare('SELECT * FROM appointments WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!existing) throw new Error('Agendamento não encontrado.');
 
       let primaryServiceId = b.serviceId ? Number(b.serviceId) : existing.service_id;
@@ -854,7 +1094,9 @@ app.put('/api/appointments/:id', (req, res) => {
         let firstId = 0;
 
         for (const item of b.services) {
-          const srv = db.prepare('SELECT * FROM services WHERE id = ?').get(Number(item.serviceId)) as any;
+          const srv = db
+            .prepare('SELECT * FROM services WHERE id = ? AND tenant_id = ?')
+            .get(Number(item.serviceId), tenantId) as any;
           if (!srv) continue;
           if (!firstId) firstId = srv.id;
           const dur =
@@ -889,9 +1131,10 @@ app.put('/api/appointments/:id', (req, res) => {
             .prepare('SELECT product_id, quantity FROM appointment_products WHERE appointment_id = ?')
             .all(id) as any[];
           for (const op of oldProds) {
-            db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?').run(
+            db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND tenant_id = ?').run(
               op.quantity,
-              op.product_id
+              op.product_id,
+              tenantId
             );
           }
         }
@@ -907,7 +1150,9 @@ app.put('/api/appointments/:id', (req, res) => {
 
         for (const item of b.products) {
           if (!item.productId || item.quantity <= 0) continue;
-          const prod = db.prepare('SELECT * FROM products WHERE id = ?').get(Number(item.productId)) as any;
+          const prod = db
+            .prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?')
+            .get(Number(item.productId), tenantId) as any;
           if (!prod) continue;
           const qty = Number(item.quantity);
           const unitPrice = item.unitPrice !== undefined ? Number(item.unitPrice) : prod.price;
@@ -916,9 +1161,10 @@ app.put('/api/appointments/:id', (req, res) => {
           insertProd.run(id, prod.id, prod.name, qty, unitPrice, prod.cost_price, subtotal);
 
           if (existing.status === 'completed') {
-            db.prepare('UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?').run(
+            db.prepare('UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ? AND tenant_id = ?').run(
               qty,
-              prod.id
+              prod.id,
+              tenantId
             );
           }
         }
@@ -941,7 +1187,7 @@ app.put('/api/appointments/:id', (req, res) => {
           total_amount = ?,
           is_fit_in = COALESCE(?, is_fit_in),
           notes = COALESCE(?, notes)
-        WHERE id = ?
+        WHERE id = ? AND tenant_id = ?
       `).run(
         b.date ?? null,
         startTime,
@@ -956,7 +1202,8 @@ app.put('/api/appointments/:id', (req, res) => {
         totalAmount,
         b.isFitIn !== undefined ? (b.isFitIn ? 1 : 0) : null,
         b.notes ?? null,
-        id
+        id,
+        tenantId
       );
     });
 
@@ -968,11 +1215,14 @@ app.put('/api/appointments/:id', (req, res) => {
 
 // Change quick status (in_progress, cancelled, scheduled)
 app.post('/api/appointments/:id/status', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const { status } = req.body;
 
   runInTransaction(() => {
-    const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any;
+    const appt = db
+      .prepare('SELECT * FROM appointments WHERE id = ? AND tenant_id = ?')
+      .get(id, tenantId) as any;
     if (!appt) throw new Error('Agendamento não encontrado');
 
     // If reverting from completed, restore stock
@@ -981,14 +1231,15 @@ app.post('/api/appointments/:id/status', (req, res) => {
         .prepare('SELECT product_id, quantity FROM appointment_products WHERE appointment_id = ?')
         .all(id) as any[];
       for (const item of items) {
-        db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?').run(
+        db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND tenant_id = ?').run(
           item.quantity,
-          item.product_id
+          item.product_id,
+          tenantId
         );
       }
     }
 
-    db.prepare('UPDATE appointments SET status = ? WHERE id = ?').run(status, id);
+    db.prepare('UPDATE appointments SET status = ? WHERE id = ? AND tenant_id = ?').run(status, id, tenantId);
   });
 
   res.json({ ok: true });
@@ -997,11 +1248,14 @@ app.post('/api/appointments/:id/status', (req, res) => {
 // FINALIZE APPOINTMENT (Service Completed & Paid + Product Add-ons + Stock Deduction)
 app.post('/api/appointments/:id/finalize', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const { servicePrice, products, discount, paymentMethod, notes } = req.body;
 
     runInTransaction(() => {
-      const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any;
+      const appt = db
+        .prepare('SELECT * FROM appointments WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!appt) throw new Error('Agendamento não encontrado.');
 
       // If already completed previously, restore previous product stock first before recalculating
@@ -1010,9 +1264,10 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
           .prepare('SELECT product_id, quantity FROM appointment_products WHERE appointment_id = ?')
           .all(id) as any[];
         for (const pi of prevItems) {
-          db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?').run(
+          db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND tenant_id = ?').run(
             pi.quantity,
-            pi.product_id
+            pi.product_id,
+            tenantId
           );
         }
       }
@@ -1029,7 +1284,9 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
 
         for (const item of products) {
           if (!item.productId || item.quantity <= 0) continue;
-          const prod = db.prepare('SELECT * FROM products WHERE id = ?').get(Number(item.productId)) as any;
+          const prod = db
+            .prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?')
+            .get(Number(item.productId), tenantId) as any;
           if (!prod) throw new Error(`Produto #${item.productId} não encontrado.`);
 
           const qty = Number(item.quantity);
@@ -1044,7 +1301,11 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
           productsTotal += subtotal;
 
           insertProd.run(id, prod.id, prod.name, qty, unitPrice, prod.cost_price, subtotal);
-          db.prepare('UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?').run(qty, prod.id);
+          db.prepare('UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ? AND tenant_id = ?').run(
+            qty,
+            prod.id,
+            tenantId
+          );
         }
       } else {
         // Deduct existing attached products
@@ -1053,16 +1314,19 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
           .all(id) as any[];
         productsTotal = 0;
         for (const item of existingItems) {
-          const prod = db.prepare('SELECT * FROM products WHERE id = ?').get(item.product_id) as any;
+          const prod = db
+            .prepare('SELECT * FROM products WHERE id = ? AND tenant_id = ?')
+            .get(item.product_id, tenantId) as any;
           if (prod && prod.stock_quantity < item.quantity) {
             throw new Error(
               `Estoque insuficiente para "${prod.name}" (Disponível: ${prod.stock_quantity}, Solicitado: ${item.quantity}).`
             );
           }
           productsTotal += item.subtotal;
-          db.prepare('UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?').run(
+          db.prepare('UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ? AND tenant_id = ?').run(
             item.quantity,
-            item.product_id
+            item.product_id,
+            tenantId
           );
         }
       }
@@ -1084,7 +1348,7 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
           refund_reason = '',
           refunded_at = NULL,
           notes = COALESCE(?, notes)
-        WHERE id = ?
+        WHERE id = ? AND tenant_id = ?
       `).run(
         finalServicePrice,
         productsTotal,
@@ -1092,7 +1356,8 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
         totalAmount,
         paymentMethod || 'pix',
         notes ?? null,
-        id
+        id,
+        tenantId
       );
     });
 
@@ -1105,6 +1370,7 @@ app.post('/api/appointments/:id/finalize', (req, res) => {
 // REFUND APPOINTMENT INCOME (Estorno de Comanda Finalizada com motivo obrigatório por escrito)
 app.post('/api/appointments/:id/refund', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const reason = String(req.body.reason || '').trim();
     if (!reason || reason.length < 3) {
@@ -1112,7 +1378,9 @@ app.post('/api/appointments/:id/refund', (req, res) => {
     }
 
     runInTransaction(() => {
-      const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any;
+      const appt = db
+        .prepare('SELECT * FROM appointments WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!appt) throw new Error('Comanda / agendamento não encontrado.');
       if (appt.is_refunded) throw new Error('Esta comanda já foi estornada anteriormente.');
 
@@ -1122,9 +1390,10 @@ app.post('/api/appointments/:id/refund', (req, res) => {
           .prepare('SELECT product_id, quantity FROM appointment_products WHERE appointment_id = ?')
           .all(id) as any[];
         for (const item of items) {
-          db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?').run(
+          db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND tenant_id = ?').run(
             item.quantity,
-            item.product_id
+            item.product_id,
+            tenantId
           );
         }
       }
@@ -1135,8 +1404,8 @@ app.post('/api/appointments/:id/refund', (req, res) => {
           refund_reason = ?,
           refunded_at = datetime('now', 'localtime'),
           status = 'cancelled'
-        WHERE id = ?
-      `).run(reason, id);
+        WHERE id = ? AND tenant_id = ?
+      `).run(reason, id, tenantId);
     });
 
     res.json({ ok: true });
@@ -1146,21 +1415,25 @@ app.post('/api/appointments/:id/refund', (req, res) => {
 });
 
 app.delete('/api/appointments/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   runInTransaction(() => {
-    const appt = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any;
+    const appt = db
+      .prepare('SELECT * FROM appointments WHERE id = ? AND tenant_id = ?')
+      .get(id, tenantId) as any;
     if (appt && appt.status === 'completed') {
       const prevItems = db
         .prepare('SELECT product_id, quantity FROM appointment_products WHERE appointment_id = ?')
         .all(id) as any[];
       for (const pi of prevItems) {
-        db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?').run(
+        db.prepare('UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND tenant_id = ?').run(
           pi.quantity,
-          pi.product_id
+          pi.product_id,
+          tenantId
         );
       }
     }
-    db.prepare('DELETE FROM appointments WHERE id = ?').run(id);
+    db.prepare('DELETE FROM appointments WHERE id = ? AND tenant_id = ?').run(id, tenantId);
   });
   res.json({ ok: true });
 });
@@ -1168,10 +1441,11 @@ app.delete('/api/appointments/:id', (req, res) => {
 // ==========================================
 // 7. WHATSAPP & SMS NOTIFICATIONS
 // ==========================================
-app.get('/api/notifications', (_req, res) => {
+app.get('/api/notifications', (req, res) => {
+  const tenantId = getTenantId(req);
   const rows = db
-    .prepare('SELECT * FROM notification_logs ORDER BY id DESC LIMIT 50')
-    .all() as any[];
+    .prepare('SELECT * FROM notification_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT 50')
+    .all(tenantId) as any[];
   const list: NotificationLog[] = rows.map((r) => ({
     id: r.id,
     appointmentId: r.appointment_id,
@@ -1187,9 +1461,14 @@ app.get('/api/notifications', (_req, res) => {
 });
 
 app.post('/api/notifications/send', async (req, res) => {
+  const tenantId = getTenantId(req);
   const { appointmentId, clientId, channel, customMessage } = req.body;
-  const settings = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as any;
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(Number(clientId)) as any;
+  const settings = db
+    .prepare('SELECT * FROM company_settings WHERE tenant_id = ? LIMIT 1')
+    .get(tenantId) as any;
+  const client = db
+    .prepare('SELECT * FROM clients WHERE id = ? AND tenant_id = ?')
+    .get(Number(clientId), tenantId) as any;
   if (!client) return res.status(400).json({ error: 'Cliente não encontrado.' });
 
   let message = customMessage || '';
@@ -1200,11 +1479,11 @@ app.post('/api/notifications/send', async (req, res) => {
         FROM appointments a
         JOIN services s ON s.id = a.service_id
         JOIN professionals p ON p.id = a.professional_id
-        WHERE a.id = ?
+        WHERE a.id = ? AND a.tenant_id = ?
       `)
-      .get(Number(appointmentId)) as any;
+      .get(Number(appointmentId), tenantId) as any;
 
-    if (appt) {
+    if (appt && settings) {
       const [y, m, d] = appt.date.split('-');
       const formattedDate = `${d}/${m}/${y}`;
       const formattedCurrency = `R$ ${Number(appt.total_amount).toFixed(2).replace('.', ',')}`;
@@ -1228,7 +1507,7 @@ app.post('/api/notifications/send', async (req, res) => {
   }
 
   if (!message) {
-    message = `Olá ${client.full_name}, mensagem de ${settings.name}.`;
+    message = `Olá ${client.full_name}, mensagem de ${settings?.name || 'Estabelecimento'}.`;
   }
 
   const digits = String(client.phone).replace(/\D/g, '');
@@ -1237,7 +1516,7 @@ app.post('/api/notifications/send', async (req, res) => {
   let status: 'sent_link' | 'sent_webhook' | 'simulated' = channel === 'whatsapp' ? 'sent_link' : 'simulated';
 
   // If a Webhook (Z-API / Evolution API / Twilio) is configured, fire it asynchronously
-  if (settings.webhook_url && settings.webhook_url.startsWith('http')) {
+  if (settings?.webhook_url && settings.webhook_url.startsWith('http')) {
     try {
       await fetch(settings.webhook_url, {
         method: 'POST',
@@ -1258,10 +1537,10 @@ app.post('/api/notifications/send', async (req, res) => {
 
   const logResult = db
     .prepare(`
-      INSERT INTO notification_logs (appointment_id, client_id, client_name, client_phone, channel, message, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO notification_logs (tenant_id, appointment_id, client_id, client_name, client_phone, channel, message, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    .run(appointmentId || null, client.id, client.full_name, client.phone, channel, message, status);
+    .run(tenantId, appointmentId || null, client.id, client.full_name, client.phone, channel, message, status);
 
   const whatsappUrl = `https://wa.me/${fullPhone}?text=${encodeURIComponent(message)}`;
   const smsUrl = `sms:+${fullPhone}?body=${encodeURIComponent(message)}`;
@@ -1343,10 +1622,11 @@ function computeDateRange(period: FinancialPeriod, refDateStr: string): {
 }
 
 app.get('/api/financial/report', (req, res) => {
+  const tenantId = getTenantId(req);
   const period = (req.query.period as FinancialPeriod) || 'monthly';
   const referenceDate = (req.query.date as string) || getTodayStr();
   const { startDate, endDate, label } = computeDateRange(period, referenceDate);
-  const rates = getCardFeeRates();
+  const rates = getCardFeeRates(tenantId);
 
   // Completed appointments in range (excluding refunded)
   const apptRows = db
@@ -1364,14 +1644,15 @@ app.get('/api/financial/report', (req, res) => {
       JOIN clients c ON c.id = a.client_id
       JOIN professionals p ON p.id = a.professional_id
       JOIN services s ON s.id = a.service_id
-      WHERE a.status = 'completed'
+      WHERE a.tenant_id = ?
+        AND a.status = 'completed'
         AND COALESCE(a.is_refunded, 0) = 0
         AND a.date >= ? AND a.date <= ?
       ORDER BY a.date DESC, a.start_time DESC
     `)
-    .all(startDate, endDate) as any[];
+    .all(tenantId, startDate, endDate) as any[];
 
-  const completedAppointments = hydrateAppointments(apptRows);
+  const completedAppointments = hydrateAppointments(apptRows, tenantId);
 
   // Refunded appointments in range (for audit & display in ledger)
   const refundedApptRows = db
@@ -1389,13 +1670,14 @@ app.get('/api/financial/report', (req, res) => {
       JOIN clients c ON c.id = a.client_id
       JOIN professionals p ON p.id = a.professional_id
       JOIN services s ON s.id = a.service_id
-      WHERE COALESCE(a.is_refunded, 0) = 1
+      WHERE a.tenant_id = ?
+        AND COALESCE(a.is_refunded, 0) = 1
         AND a.date >= ? AND a.date <= ?
       ORDER BY a.date DESC, a.start_time DESC
     `)
-    .all(startDate, endDate) as any[];
+    .all(tenantId, startDate, endDate) as any[];
 
-  const refundedAppointments = hydrateAppointments(refundedApptRows);
+  const refundedAppointments = hydrateAppointments(refundedApptRows, tenantId);
 
   // Products sold in completed (non-refunded) appointments in range
   const soldProductRows = db
@@ -1410,20 +1692,21 @@ app.get('/api/financial/report', (req, res) => {
         a.date
       FROM appointment_products ap
       JOIN appointments a ON a.id = ap.appointment_id
-      WHERE a.status = 'completed'
+      WHERE a.tenant_id = ?
+        AND a.status = 'completed'
         AND COALESCE(a.is_refunded, 0) = 0
         AND a.date >= ? AND a.date <= ?
     `)
-    .all(startDate, endDate) as any[];
+    .all(tenantId, startDate, endDate) as any[];
 
   // Manual transactions in range
   const manualRows = db
     .prepare(`
       SELECT * FROM manual_transactions
-      WHERE date >= ? AND date <= ?
+      WHERE tenant_id = ? AND date >= ? AND date <= ?
       ORDER BY date DESC, id DESC
     `)
-    .all(startDate, endDate) as any[];
+    .all(tenantId, startDate, endDate) as any[];
 
   const manualTransactions: ManualTransaction[] = manualRows.map((m) => {
     const isRef = Boolean(m.is_refunded);
@@ -1691,16 +1974,18 @@ app.get('/api/financial/report', (req, res) => {
 });
 
 app.post('/api/financial/transactions', (req, res) => {
+  const tenantId = getTenantId(req);
   const { date, type, category, description, amount, paymentMethod } = req.body;
   if (!description?.trim() || !amount) {
     return res.status(400).json({ error: 'Descrição e valor são obrigatórios.' });
   }
   const result = db
     .prepare(`
-      INSERT INTO manual_transactions (date, type, category, description, amount, payment_method)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO manual_transactions (tenant_id, date, type, category, description, amount, payment_method)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
+      tenantId,
       date || getTodayStr(),
       type === 'income' ? 'income' : 'expense',
       (category || 'Operacional').trim(),
@@ -1713,12 +1998,15 @@ app.post('/api/financial/transactions', (req, res) => {
 
 // REFUND MANUAL INCOME TRANSACTION (Estorno de Entrada Extra com motivo obrigatório por escrito)
 app.post('/api/financial/transactions/:id/refund', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const reason = String(req.body.reason || '').trim();
   if (!reason || reason.length < 3) {
     return res.status(400).json({ error: 'É obrigatório informar por escrito o motivo do estorno.' });
   }
-  const tx = db.prepare('SELECT * FROM manual_transactions WHERE id = ?').get(id) as any;
+  const tx = db
+    .prepare('SELECT * FROM manual_transactions WHERE id = ? AND tenant_id = ?')
+    .get(id, tenantId) as any;
   if (!tx) return res.status(404).json({ error: 'Lançamento não encontrado.' });
   if (tx.type !== 'income') {
     return res.status(400).json({ error: 'Apenas valores de entrada podem ser estornados.' });
@@ -1732,15 +2020,16 @@ app.post('/api/financial/transactions/:id/refund', (req, res) => {
       is_refunded = 1,
       refund_reason = ?,
       refunded_at = datetime('now', 'localtime')
-    WHERE id = ?
-  `).run(reason, id);
+    WHERE id = ? AND tenant_id = ?
+  `).run(reason, id, tenantId);
 
   res.json({ ok: true });
 });
 
 app.delete('/api/financial/transactions/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
-  db.prepare('DELETE FROM manual_transactions WHERE id = ?').run(id);
+  db.prepare('DELETE FROM manual_transactions WHERE id = ? AND tenant_id = ?').run(id, tenantId);
   res.json({ ok: true });
 });
 
@@ -1764,11 +2053,12 @@ function addMonthsToDateStr(dateStr: string, monthsToAdd: number): string {
   return `${targetYear}-${String(targetMonthIndex + 1).padStart(2, '0')}-${String(clampedDay).padStart(2, '0')}`;
 }
 
-app.get('/api/financial/payables', (_req, res) => {
+app.get('/api/financial/payables', (req, res) => {
+  const tenantId = getTenantId(req);
   const today = getTodayStr();
   const rows = db
-    .prepare('SELECT * FROM payable_accounts ORDER BY status ASC, due_date ASC, id ASC')
-    .all() as any[];
+    .prepare('SELECT * FROM payable_accounts WHERE tenant_id = ? ORDER BY status ASC, due_date ASC, id ASC')
+    .all(tenantId) as any[];
 
   const list: PayableAccount[] = rows.map((r) => {
     const daysUntilDue = computeDaysDiff(today, r.due_date);
@@ -1811,6 +2101,7 @@ app.get('/api/financial/payables', (_req, res) => {
 
 app.post('/api/financial/payables', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const {
       description,
       category,
@@ -1835,9 +2126,9 @@ app.post('/api/financial/payables', (req, res) => {
 
     const insertStmt = db.prepare(`
       INSERT INTO payable_accounts (
-        description, category, amount, due_date, recurrence_type,
+        tenant_id, description, category, amount, due_date, recurrence_type,
         installment_number, total_installments, recurrence_group_id, status, payment_method
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
     `);
 
     const createdIds: number[] = [];
@@ -1845,6 +2136,7 @@ app.post('/api/financial/payables', (req, res) => {
     runInTransaction(() => {
       if (recType === 'once') {
         const resInsert = insertStmt.run(
+          tenantId,
           description.trim(),
           cat,
           baseAmount,
@@ -1862,6 +2154,7 @@ app.post('/api/financial/payables', (req, res) => {
         for (let i = 0; i < count; i++) {
           const targetDue = addMonthsToDateStr(dueDate, i);
           const resInsert = insertStmt.run(
+            tenantId,
             description.trim(),
             cat,
             baseAmount,
@@ -1880,6 +2173,7 @@ app.post('/api/financial/payables', (req, res) => {
         for (let i = 0; i < count; i++) {
           const targetDue = addMonthsToDateStr(dueDate, i);
           const resInsert = insertStmt.run(
+            tenantId,
             `${description.trim()} (Parcela ${i + 1}/${count})`,
             cat,
             baseAmount,
@@ -1904,22 +2198,26 @@ app.post('/api/financial/payables', (req, res) => {
 // MARK PAYABLE ACCOUNT AS PAID -> Automatically launches as Expense on the day in the financial balance
 app.post('/api/financial/payables/:id/pay', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const paymentMethod = req.body.paymentMethod || 'pix';
     const paymentDate = req.body.paymentDate || getTodayStr();
 
     runInTransaction(() => {
-      const acc = db.prepare('SELECT * FROM payable_accounts WHERE id = ?').get(id) as any;
+      const acc = db
+        .prepare('SELECT * FROM payable_accounts WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!acc) throw new Error('Conta a pagar não encontrada.');
       if (acc.status === 'paid') throw new Error('Esta conta já está marcada como paga.');
 
       // Launch as an expense on the day in manual_transactions so it enters the financial balance
       const txRes = db
         .prepare(`
-          INSERT INTO manual_transactions (date, type, category, description, amount, payment_method)
-          VALUES (?, 'expense', ?, ?, ?, ?)
+          INSERT INTO manual_transactions (tenant_id, date, type, category, description, amount, payment_method)
+          VALUES (?, ?, 'expense', ?, ?, ?, ?)
         `)
         .run(
+          tenantId,
           paymentDate,
           acc.category || 'Contas a Pagar',
           `[Conta Paga] ${acc.description}`,
@@ -1937,8 +2235,8 @@ app.post('/api/financial/payables/:id/pay', (req, res) => {
           manual_transaction_id = ?,
           refund_reason = NULL,
           refunded_at = NULL
-        WHERE id = ?
-      `).run(paymentDate, paymentMethod || acc.payment_method || 'pix', txId, id);
+        WHERE id = ? AND tenant_id = ?
+      `).run(paymentDate, paymentMethod || acc.payment_method || 'pix', txId, id, tenantId);
     });
 
     res.json({ ok: true });
@@ -1950,6 +2248,7 @@ app.post('/api/financial/payables/:id/pay', (req, res) => {
 // UPDATE PAYABLE ACCOUNT (Edição com opção de atualizar todas as parcelas/meses subsequentes)
 app.put('/api/financial/payables/:id', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const { description, category, amount, dueDate, paymentMethod, updateSubsequent } = req.body;
 
@@ -1958,7 +2257,9 @@ app.put('/api/financial/payables/:id', (req, res) => {
     }
 
     runInTransaction(() => {
-      const acc = db.prepare('SELECT * FROM payable_accounts WHERE id = ?').get(id) as any;
+      const acc = db
+        .prepare('SELECT * FROM payable_accounts WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!acc) throw new Error('Conta a pagar não encontrada.');
 
       const newDesc = description.trim();
@@ -1974,8 +2275,8 @@ app.put('/api/financial/payables/:id', (req, res) => {
           amount = ?,
           due_date = ?,
           payment_method = ?
-        WHERE id = ?
-      `).run(newDesc, newCat, newAmount, newDueDate, newPm, id);
+        WHERE id = ? AND tenant_id = ?
+      `).run(newDesc, newCat, newAmount, newDueDate, newPm, id, tenantId);
 
       if (acc.status === 'paid' && acc.manual_transaction_id) {
         db.prepare(`
@@ -1984,8 +2285,8 @@ app.put('/api/financial/payables/:id', (req, res) => {
             description = ?,
             amount = ?,
             payment_method = ?
-          WHERE id = ?
-        `).run(newCat, `[Conta Paga] ${newDesc}`, newAmount, newPm, acc.manual_transaction_id);
+          WHERE id = ? AND tenant_id = ?
+        `).run(newCat, `[Conta Paga] ${newDesc}`, newAmount, newPm, acc.manual_transaction_id, tenantId);
       }
 
       if (updateSubsequent && acc.recurrence_group_id) {
@@ -1995,7 +2296,8 @@ app.put('/api/financial/payables/:id', (req, res) => {
         const subsequentRows = db
           .prepare(`
             SELECT * FROM payable_accounts
-            WHERE recurrence_group_id = ?
+            WHERE tenant_id = ?
+              AND recurrence_group_id = ?
               AND id != ?
               AND (
                 (installment_number IS NOT NULL AND ? IS NOT NULL AND installment_number > ?)
@@ -2004,6 +2306,7 @@ app.put('/api/financial/payables/:id', (req, res) => {
             ORDER BY installment_number ASC, due_date ASC
           `)
           .all(
+            tenantId,
             acc.recurrence_group_id,
             id,
             acc.installment_number,
@@ -2030,8 +2333,8 @@ app.put('/api/financial/payables/:id', (req, res) => {
               amount = ?,
               due_date = ?,
               payment_method = ?
-            WHERE id = ?
-          `).run(subDesc, newCat, newAmount, targetDue, newPm, sub.id);
+            WHERE id = ? AND tenant_id = ?
+          `).run(subDesc, newCat, newAmount, targetDue, newPm, sub.id, tenantId);
 
           if (sub.status === 'paid' && sub.manual_transaction_id) {
             db.prepare(`
@@ -2040,8 +2343,8 @@ app.put('/api/financial/payables/:id', (req, res) => {
                 description = ?,
                 amount = ?,
                 payment_method = ?
-              WHERE id = ?
-            `).run(newCat, `[Conta Paga] ${subDesc}`, newAmount, newPm, sub.manual_transaction_id);
+              WHERE id = ? AND tenant_id = ?
+            `).run(newCat, `[Conta Paga] ${subDesc}`, newAmount, newPm, sub.manual_transaction_id, tenantId);
           }
         }
       }
@@ -2056,6 +2359,7 @@ app.put('/api/financial/payables/:id', (req, res) => {
 // REFUND A PAID PAYABLE ACCOUNT (Estornar conta paga -> exige motivo e remove a despesa do Balanço)
 app.post('/api/financial/payables/:id/refund', (req, res) => {
   try {
+    const tenantId = getTenantId(req);
     const id = Number(req.params.id);
     const reason = String(req.body.reason || '').trim();
     if (!reason || reason.length < 3) {
@@ -2063,7 +2367,9 @@ app.post('/api/financial/payables/:id/refund', (req, res) => {
     }
 
     runInTransaction(() => {
-      const acc = db.prepare('SELECT * FROM payable_accounts WHERE id = ?').get(id) as any;
+      const acc = db
+        .prepare('SELECT * FROM payable_accounts WHERE id = ? AND tenant_id = ?')
+        .get(id, tenantId) as any;
       if (!acc) throw new Error('Conta a pagar não encontrada.');
       if (acc.status !== 'paid') {
         throw new Error('Apenas contas já pagas podem ter o pagamento estornado.');
@@ -2071,16 +2377,20 @@ app.post('/api/financial/payables/:id/refund', (req, res) => {
 
       // Remove the expense from manual_transactions so it is removed from the Financial Balance
       if (acc.manual_transaction_id) {
-        db.prepare('DELETE FROM manual_transactions WHERE id = ?').run(acc.manual_transaction_id);
+        db.prepare('DELETE FROM manual_transactions WHERE id = ? AND tenant_id = ?').run(
+          acc.manual_transaction_id,
+          tenantId
+        );
       } else {
         // Fallback if manual_transaction_id wasn't linked
         db.prepare(`
           DELETE FROM manual_transactions
-          WHERE type = 'expense'
+          WHERE tenant_id = ?
+            AND type = 'expense'
             AND date = ?
             AND amount = ?
             AND description = ?
-        `).run(acc.paid_at || acc.due_date, acc.amount, `[Conta Paga] ${acc.description}`);
+        `).run(tenantId, acc.paid_at || acc.due_date, acc.amount, `[Conta Paga] ${acc.description}`);
       }
 
       db.prepare(`
@@ -2090,8 +2400,8 @@ app.post('/api/financial/payables/:id/refund', (req, res) => {
           manual_transaction_id = NULL,
           refund_reason = ?,
           refunded_at = datetime('now', 'localtime')
-        WHERE id = ?
-      `).run(reason, id);
+        WHERE id = ? AND tenant_id = ?
+      `).run(reason, id, tenantId);
     });
 
     res.json({ ok: true });
@@ -2101,19 +2411,23 @@ app.post('/api/financial/payables/:id/refund', (req, res) => {
 });
 
 app.delete('/api/financial/payables/:id', (req, res) => {
+  const tenantId = getTenantId(req);
   const id = Number(req.params.id);
   const deleteSubsequent =
     req.query.deleteSubsequent === 'true' || req.query.deleteAllGroup === 'true';
 
   runInTransaction(() => {
-    const acc = db.prepare('SELECT * FROM payable_accounts WHERE id = ?').get(id) as any;
+    const acc = db
+      .prepare('SELECT * FROM payable_accounts WHERE id = ? AND tenant_id = ?')
+      .get(id, tenantId) as any;
     if (!acc) return;
 
     if (deleteSubsequent && acc.recurrence_group_id) {
       const toDelete = db
         .prepare(`
           SELECT id, manual_transaction_id FROM payable_accounts
-          WHERE recurrence_group_id = ?
+          WHERE tenant_id = ?
+            AND recurrence_group_id = ?
             AND (
               id = ?
               OR (installment_number IS NOT NULL AND ? IS NOT NULL AND installment_number >= ?)
@@ -2121,6 +2435,7 @@ app.delete('/api/financial/payables/:id', (req, res) => {
             )
         `)
         .all(
+          tenantId,
           acc.recurrence_group_id,
           id,
           acc.installment_number,
@@ -2130,18 +2445,510 @@ app.delete('/api/financial/payables/:id', (req, res) => {
 
       for (const row of toDelete) {
         if (row.manual_transaction_id) {
-          db.prepare('DELETE FROM manual_transactions WHERE id = ?').run(row.manual_transaction_id);
+          db.prepare('DELETE FROM manual_transactions WHERE id = ? AND tenant_id = ?').run(
+            row.manual_transaction_id,
+            tenantId
+          );
         }
-        db.prepare('DELETE FROM payable_accounts WHERE id = ?').run(row.id);
+        db.prepare('DELETE FROM payable_accounts WHERE id = ? AND tenant_id = ?').run(row.id, tenantId);
       }
     } else {
       if (acc.manual_transaction_id) {
-        db.prepare('DELETE FROM manual_transactions WHERE id = ?').run(acc.manual_transaction_id);
+        db.prepare('DELETE FROM manual_transactions WHERE id = ? AND tenant_id = ?').run(
+          acc.manual_transaction_id,
+          tenantId
+        );
       }
-      db.prepare('DELETE FROM payable_accounts WHERE id = ?').run(id);
+      db.prepare('DELETE FROM payable_accounts WHERE id = ? AND tenant_id = ?').run(id, tenantId);
     }
   });
 
+  res.json({ ok: true });
+});
+
+// ==========================================
+// 10. PAINEL ADMINISTRATIVO DO SAAS (SUPERADMIN)
+// ==========================================
+function requireSuperAdmin(req: express.Request, res: express.Response): AuthUser | null {
+  const user = getAuthUserFromRequest(req);
+  if (!user || user.role !== 'superadmin') {
+    res.status(403).json({ error: 'Acesso restrito ao Painel Administrador.' });
+    return null;
+  }
+  return user;
+}
+
+app.get('/api/admin/overview', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+
+  const tenantRows = db
+    .prepare('SELECT * FROM saas_tenants ORDER BY id DESC')
+    .all() as any[];
+
+  const tenants: SaasTenant[] = tenantRows.map((t) => {
+    const tid = t.id;
+    const apptStats = db
+      .prepare(`
+        SELECT
+          COUNT(*) as total_appointments,
+          SUM(CASE WHEN status = 'completed' AND COALESCE(is_refunded, 0) = 0 THEN 1 ELSE 0 END) as completed_appointments,
+          SUM(CASE WHEN status = 'completed' AND COALESCE(is_refunded, 0) = 0 THEN total_amount ELSE 0 END) as gross_revenue,
+          MAX(date) as last_appointment_date
+        FROM appointments
+        WHERE tenant_id = ?
+      `)
+      .get(tid) as any;
+
+    const clientsCount =
+      (db.prepare('SELECT COUNT(*) as c FROM clients WHERE tenant_id = ?').get(tid) as any)?.c || 0;
+    const profsCount =
+      (
+        db
+          .prepare('SELECT COUNT(*) as c FROM professionals WHERE tenant_id = ? AND active = 1')
+          .get(tid) as any
+      )?.c || 0;
+    const servicesCount =
+      (
+        db
+          .prepare('SELECT COUNT(*) as c FROM services WHERE tenant_id = ? AND active = 1')
+          .get(tid) as any
+      )?.c || 0;
+    const productsCount =
+      (
+        db
+          .prepare('SELECT COUNT(*) as c FROM products WHERE tenant_id = ? AND active = 1')
+          .get(tid) as any
+      )?.c || 0;
+
+    return {
+      id: t.id,
+      name: t.name,
+      ownerName: t.owner_name,
+      email: t.email,
+      phone: t.phone,
+      document: t.document,
+      businessType: t.business_type,
+      planName: t.plan_name,
+      monthlyFee: Number(t.monthly_fee) || 0,
+      dueDay: Number(t.due_day) || 10,
+      status: t.status,
+      notes: t.notes || '',
+      createdAt: t.created_at,
+      lastLoginAt: t.last_login_at || null,
+      metrics: {
+        appointmentsTotal: Number(apptStats?.total_appointments) || 0,
+        completedAppointments: Number(apptStats?.completed_appointments) || 0,
+        clientsCount: Number(clientsCount) || 0,
+        professionalsCount: Number(profsCount) || 0,
+        servicesCount: Number(servicesCount) || 0,
+        productsCount: Number(productsCount) || 0,
+        grossRevenueProcessed: Number(apptStats?.gross_revenue) || 0,
+        lastAppointmentDate: apptStats?.last_appointment_date || null,
+      },
+    };
+  });
+
+  const paymentRows = db
+    .prepare(`
+      SELECT
+        p.*,
+        t.name as tenant_name,
+        t.owner_name
+      FROM saas_payments p
+      JOIN saas_tenants t ON t.id = p.tenant_id
+      ORDER BY p.due_date DESC, p.id DESC
+    `)
+    .all() as any[];
+
+  const todayStr = getTodayStr();
+  const payments: SaasPayment[] = paymentRows.map((p) => {
+    let status = p.status as 'paid' | 'pending' | 'overdue';
+    if (status === 'pending' && p.due_date < todayStr) {
+      status = 'overdue';
+    }
+    return {
+      id: p.id,
+      tenantId: p.tenant_id,
+      tenantName: p.tenant_name,
+      ownerName: p.owner_name,
+      referenceMonth: p.reference_month,
+      amount: Number(p.amount) || 0,
+      dueDate: p.due_date,
+      paidAt: p.paid_at || null,
+      status,
+      paymentMethod: p.payment_method || 'pix',
+      notes: p.notes || '',
+      createdAt: p.created_at,
+    };
+  });
+
+  const staffRows = db
+    .prepare(
+      "SELECT id, name, email, role, active, created_at, last_login_at FROM users WHERE role = 'superadmin' ORDER BY id ASC"
+    )
+    .all() as any[];
+
+  const currentMonthPrefix = todayStr.slice(0, 7);
+  const activeTenants = tenants.filter((t) => t.status === 'active' || t.status === 'trial').length;
+  const suspendedTenants = tenants.filter((t) => t.status === 'suspended').length;
+  const mrr = tenants
+    .filter((t) => t.status === 'active')
+    .reduce((acc, t) => acc + t.monthlyFee, 0);
+
+  const receivedThisMonth = payments
+    .filter(
+      (p) =>
+        p.status === 'paid' &&
+        ((p.paidAt && p.paidAt.startsWith(currentMonthPrefix)) ||
+          p.referenceMonth === currentMonthPrefix)
+    )
+    .reduce((acc, p) => acc + p.amount, 0);
+
+  const pendingPaymentsTotal = payments
+    .filter((p) => p.status !== 'paid')
+    .reduce((acc, p) => acc + p.amount, 0);
+
+  const totalPlatformAppointments = tenants.reduce(
+    (acc, t) => acc + t.metrics.appointmentsTotal,
+    0
+  );
+  const totalPlatformClients = tenants.reduce((acc, t) => acc + t.metrics.clientsCount, 0);
+
+  const overview: SaasAdminOverview = {
+    summary: {
+      totalTenants: tenants.length,
+      activeTenants,
+      suspendedTenants,
+      mrr,
+      receivedThisMonth,
+      pendingPaymentsTotal,
+      totalPlatformAppointments,
+      totalPlatformClients,
+    },
+    tenants,
+    payments,
+    adminStaff: staffRows.map((s) => ({
+      id: s.id,
+      name: s.name,
+      email: s.email,
+      role: s.role,
+      active: Boolean(s.active),
+      createdAt: s.created_at,
+      lastLoginAt: s.last_login_at || null,
+    })),
+  };
+
+  res.json(overview);
+});
+
+// Create a new Hairdresser / Salon Client (Tenant + User Credentials + Workspace)
+app.post('/api/admin/tenants', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const {
+      name,
+      ownerName,
+      email,
+      password,
+      phone,
+      document,
+      businessType,
+      planName,
+      monthlyFee,
+      dueDay,
+      status,
+      notes,
+    } = req.body;
+
+    if (!name?.trim() || !email?.trim() || !password?.trim()) {
+      return res.status(400).json({
+        error: 'Nome do estabelecimento, e-mail de login e senha inicial são obrigatórios.',
+      });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existingUser = db
+      .prepare('SELECT id FROM users WHERE LOWER(email) = ?')
+      .get(cleanEmail) as any;
+    if (existingUser) {
+      return res.status(400).json({ error: 'Já existe um usuário cadastrado com este e-mail.' });
+    }
+
+    const createdTenantId = runInTransaction(() => {
+      const tRes = db
+        .prepare(`
+          INSERT INTO saas_tenants (
+            name, owner_name, email, phone, document, business_type,
+            plan_name, monthly_fee, due_day, status, notes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          name.trim(),
+          (ownerName || name).trim(),
+          cleanEmail,
+          (phone || '').trim(),
+          (document || '').trim(),
+          businessType || 'Cabelo & Barba',
+          planName || 'Plano Profissional',
+          Number(monthlyFee) || 99.9,
+          Number(dueDay) || 10,
+          status || 'active',
+          (notes || '').trim()
+        );
+
+      const newTenantId = Number(tRes.lastInsertRowid);
+
+      db.prepare(`
+        INSERT INTO users (name, email, password_hash, role, tenant_id, active)
+        VALUES (?, ?, ?, 'tenant', ?, 1)
+      `).run((ownerName || name).trim(), cleanEmail, hashPassword(String(password)), newTenantId);
+
+      // Provision initial salon workspace (company_settings, default professional, basic services)
+      ensureTenantWorkspace(
+        newTenantId,
+        name.trim(),
+        businessType || 'Cabelo & Barba',
+        (phone || '').trim(),
+        (ownerName || name).trim()
+      );
+
+      // Create initial current month subscription invoice
+      const today = getTodayStr();
+      const refMonth = today.slice(0, 7);
+      const dayStr = String(Math.min(28, Math.max(1, Number(dueDay) || 10))).padStart(2, '0');
+      db.prepare(`
+        INSERT INTO saas_payments (tenant_id, reference_month, amount, due_date, status, payment_method, notes)
+        VALUES (?, ?, ?, ?, 'pending', 'pix', 'Primeira mensalidade')
+      `).run(newTenantId, refMonth, Number(monthlyFee) || 99.9, `${refMonth}-${dayStr}`);
+
+      return newTenantId;
+    });
+
+    res.status(201).json({ id: createdTenantId });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Erro ao cadastrar cliente.' });
+  }
+});
+
+// Update Tenant details, status (active/suspended) or reset credentials
+app.put('/api/admin/tenants/:id', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const id = Number(req.params.id);
+    const {
+      name,
+      ownerName,
+      email,
+      newPassword,
+      phone,
+      document,
+      businessType,
+      planName,
+      monthlyFee,
+      dueDay,
+      status,
+      notes,
+    } = req.body;
+
+    const existing = db.prepare('SELECT * FROM saas_tenants WHERE id = ?').get(id) as any;
+    if (!existing) return res.status(404).json({ error: 'Cliente não encontrado.' });
+
+    const cleanEmail = email ? String(email).trim().toLowerCase() : existing.email;
+
+    runInTransaction(() => {
+      db.prepare(`
+        UPDATE saas_tenants SET
+          name = ?,
+          owner_name = ?,
+          email = ?,
+          phone = ?,
+          document = ?,
+          business_type = ?,
+          plan_name = ?,
+          monthly_fee = ?,
+          due_day = ?,
+          status = ?,
+          notes = ?
+        WHERE id = ?
+      `).run(
+        (name ?? existing.name).trim(),
+        (ownerName ?? existing.owner_name).trim(),
+        cleanEmail,
+        (phone ?? existing.phone).trim(),
+        (document ?? existing.document).trim(),
+        businessType ?? existing.business_type,
+        planName ?? existing.plan_name,
+        monthlyFee !== undefined ? Number(monthlyFee) : existing.monthly_fee,
+        dueDay !== undefined ? Number(dueDay) : existing.due_day,
+        status ?? existing.status,
+        (notes ?? existing.notes).trim(),
+        id
+      );
+
+      // Sync user email / name / password if provided
+      const tenantUser = db
+        .prepare("SELECT * FROM users WHERE tenant_id = ? AND role = 'tenant' LIMIT 1")
+        .get(id) as any;
+
+      if (tenantUser) {
+        if (newPassword && String(newPassword).trim().length >= 4) {
+          db.prepare(
+            'UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ?'
+          ).run(
+            (ownerName ?? existing.owner_name).trim(),
+            cleanEmail,
+            hashPassword(String(newPassword).trim()),
+            tenantUser.id
+          );
+        } else {
+          db.prepare('UPDATE users SET name = ?, email = ? WHERE id = ?').run(
+            (ownerName ?? existing.owner_name).trim(),
+            cleanEmail,
+            tenantUser.id
+          );
+        }
+      } else if (newPassword) {
+        db.prepare(`
+          INSERT INTO users (name, email, password_hash, role, tenant_id, active)
+          VALUES (?, ?, ?, 'tenant', ?, 1)
+        `).run(
+          (ownerName ?? existing.owner_name).trim(),
+          cleanEmail,
+          hashPassword(String(newPassword).trim()),
+          id
+        );
+      }
+    });
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Erro ao atualizar cliente.' });
+  }
+});
+
+app.delete('/api/admin/tenants/:id', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  runInTransaction(() => {
+    db.prepare('DELETE FROM users WHERE tenant_id = ?').run(id);
+    db.prepare('DELETE FROM saas_payments WHERE tenant_id = ?').run(id);
+    db.prepare('DELETE FROM saas_tenants WHERE id = ?').run(id);
+  });
+  res.json({ ok: true });
+});
+
+// Launch / Create SaaS Subscription Payment for a Client
+app.post('/api/admin/payments', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const { tenantId, referenceMonth, amount, dueDate, status, paymentMethod, notes } = req.body;
+    if (!tenantId || !amount || !dueDate) {
+      return res.status(400).json({ error: 'Cliente, valor e vencimento são obrigatórios.' });
+    }
+
+    const isPaid = status === 'paid';
+    const paidAt = isPaid ? req.body.paidAt || getTodayStr() : null;
+    const refMonth = referenceMonth || String(dueDate).slice(0, 7);
+
+    const result = db
+      .prepare(`
+        INSERT INTO saas_payments (
+          tenant_id, reference_month, amount, due_date, paid_at, status, payment_method, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        Number(tenantId),
+        refMonth,
+        Number(amount),
+        dueDate,
+        paidAt,
+        isPaid ? 'paid' : 'pending',
+        paymentMethod || 'pix',
+        (notes || '').trim()
+      );
+
+    res.status(201).json({ id: Number(result.lastInsertRowid) });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Erro ao lançar pagamento.' });
+  }
+});
+
+// Mark SaaS payment as paid or pending
+app.put('/api/admin/payments/:id', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  const { status, paymentMethod, paidAt, amount, dueDate, notes } = req.body;
+  const existing = db.prepare('SELECT * FROM saas_payments WHERE id = ?').get(id) as any;
+  if (!existing) return res.status(404).json({ error: 'Pagamento não encontrado.' });
+
+  const newStatus = status || existing.status;
+  const newPaidAt =
+    newStatus === 'paid' ? paidAt || existing.paid_at || getTodayStr() : null;
+
+  db.prepare(`
+    UPDATE saas_payments SET
+      status = ?,
+      paid_at = ?,
+      payment_method = ?,
+      amount = ?,
+      due_date = ?,
+      notes = ?
+    WHERE id = ?
+  `).run(
+    newStatus,
+    newPaidAt,
+    paymentMethod ?? existing.payment_method,
+    amount !== undefined ? Number(amount) : existing.amount,
+    dueDate ?? existing.due_date,
+    notes !== undefined ? String(notes).trim() : existing.notes,
+    id
+  );
+
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/payments/:id', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM saas_payments WHERE id = ?').run(id);
+  res.json({ ok: true });
+});
+
+// Create internal Admin / Employee account for the SaaS team
+app.post('/api/admin/staff', (req, res) => {
+  if (!requireSuperAdmin(req, res)) return;
+  try {
+    const { name, email, password } = req.body;
+    if (!name?.trim() || !email?.trim() || !password?.trim()) {
+      return res.status(400).json({ error: 'Nome, e-mail e senha são obrigatórios.' });
+    }
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existing = db.prepare('SELECT id FROM users WHERE LOWER(email) = ?').get(cleanEmail);
+    if (existing) {
+      return res.status(400).json({ error: 'Já existe um usuário com este e-mail.' });
+    }
+
+    const r = db
+      .prepare(`
+        INSERT INTO users (name, email, password_hash, role, tenant_id, active)
+        VALUES (?, ?, ?, 'superadmin', NULL, 1)
+      `)
+      .run(name.trim(), cleanEmail, hashPassword(String(password).trim()));
+
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Erro ao cadastrar administrador.' });
+  }
+});
+
+app.delete('/api/admin/staff/:id', (req, res) => {
+  const currentUser = requireSuperAdmin(req, res);
+  if (!currentUser) return;
+  const id = Number(req.params.id);
+  if (id === currentUser.id) {
+    return res.status(400).json({ error: 'Você não pode excluir seu próprio usuário logado.' });
+  }
+  db.prepare("DELETE FROM users WHERE id = ? AND role = 'superadmin'").run(id);
   res.json({ ok: true });
 });
 

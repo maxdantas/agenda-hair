@@ -10,14 +10,25 @@ import {
   AlertTriangle,
   BellRing,
   CalendarClock,
+  LogOut,
+  ShieldCheck,
+  ArrowLeft,
 } from 'lucide-react';
-import { api, formatDateBR } from './api';
+import {
+  api,
+  formatDateBR,
+  getStoredToken,
+  setStoredToken,
+  setInspectedTenantId,
+} from './api';
 import type {
+  AuthUser,
   Client,
   CompanySettings,
   PayableAccount,
   Product,
   Professional,
+  SaasTenant,
   ServiceItem,
 } from '../shared/types';
 import { AgendaView } from './components/AgendaView';
@@ -26,6 +37,8 @@ import { ProductsView } from './components/ProductsView';
 import { ClientsView } from './components/ClientsView';
 import { FinancialView, type FinancialSubTab } from './components/FinancialView';
 import { SettingsView } from './components/SettingsView';
+import { LoginView } from './components/LoginView';
+import { AdminDashboardView } from './components/AdminDashboardView';
 
 type ActiveTab = 'agenda' | 'services' | 'clients' | 'products' | 'financial' | 'settings';
 
@@ -38,6 +51,10 @@ function getLocalToday(): string {
 }
 
 export function App() {
+  const [authChecking, setAuthChecking] = useState<boolean>(true);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [inspectedTenant, setInspectedTenant] = useState<SaasTenant | null>(null);
+
   const [activeTab, setActiveTab] = useState<ActiveTab>('agenda');
   const [financialSubTab, setFinancialSubTab] = useState<FinancialSubTab>('balance');
   const [selectedDate, setSelectedDate] = useState<string>(getLocalToday());
@@ -55,6 +72,40 @@ export function App() {
     setTimeout(() => {
       setToast((prev) => (prev === msg ? null : prev));
     }, 3800);
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await api.logout();
+    } catch {
+      // ignore
+    }
+    setStoredToken(null);
+    setInspectedTenantId(null);
+    setInspectedTenant(null);
+    setCurrentUser(null);
+    setSettings(null);
+  }, []);
+
+  // Verify existing session token on mount
+  useEffect(() => {
+    const token = getStoredToken();
+    if (!token) {
+      setAuthChecking(false);
+      return;
+    }
+    api
+      .getMe()
+      .then((res) => {
+        setCurrentUser(res.user);
+      })
+      .catch(() => {
+        setStoredToken(null);
+        setCurrentUser(null);
+      })
+      .finally(() => {
+        setAuthChecking(false);
+      });
   }, []);
 
   const loadAll = useCallback(async () => {
@@ -76,10 +127,63 @@ export function App() {
     document.title = `${stg.name} — Gestão & Agenda`;
   }, []);
 
-  useEffect(() => {
-    loadAll();
-  }, [loadAll]);
+  const shouldShowSalonDashboard =
+    currentUser && (currentUser.role === 'tenant' || Boolean(inspectedTenant));
 
+  useEffect(() => {
+    if (shouldShowSalonDashboard) {
+      loadAll();
+    }
+  }, [shouldShowSalonDashboard, inspectedTenant, loadAll]);
+
+  if (authChecking) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#0c0a09',
+          color: '#a8a29e',
+          fontSize: 14,
+        }}
+      >
+        Verificando credenciais de acesso...
+      </div>
+    );
+  }
+
+  // 1. Not authenticated -> Render Login Screen
+  if (!currentUser) {
+    return (
+      <LoginView
+        onLoginSuccess={(user) => {
+          setInspectedTenantId(null);
+          setInspectedTenant(null);
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
+  // 2. Authenticated as SuperAdmin (and not inspecting a specific salon) -> Render Admin Panel
+  if (currentUser.role === 'superadmin' && !inspectedTenant) {
+    return (
+      <AdminDashboardView
+        currentUser={currentUser}
+        onLogout={handleLogout}
+        onInspectTenant={(tenant) => {
+          setInspectedTenantId(tenant.id);
+          setSettings(null);
+          setInspectedTenant(tenant);
+          setActiveTab('agenda');
+        }}
+      />
+    );
+  }
+
+  // 3. Hairdresser / Salon Dashboard (or SuperAdmin inspecting a client's salon)
   if (!settings) {
     return (
       <div
@@ -91,7 +195,7 @@ export function App() {
           color: 'var(--ink-secondary)',
         }}
       >
-        Inicializando sistema e banco de dados...
+        Carregando painel do estabelecimento...
       </div>
     );
   }
@@ -277,20 +381,131 @@ export function App() {
             Expediente: {settings.openTime} às {settings.closeTime}
           </div>
           <div style={{ marginTop: 2 }}>{settings.phone}</div>
+          <div
+            style={{
+              marginTop: 10,
+              paddingTop: 10,
+              borderTop: '1px solid rgba(255,255,255,0.08)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+            }}
+          >
+            <span
+              style={{
+                fontSize: 11,
+                color: '#A59E94',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title={currentUser.email}
+            >
+              {currentUser.email}
+            </span>
+            <button
+              type="button"
+              onClick={handleLogout}
+              style={{
+                background: 'rgba(239, 68, 68, 0.14)',
+                color: '#FCA5A5',
+                border: '1px solid rgba(239, 68, 68, 0.28)',
+                borderRadius: 6,
+                padding: '4px 8px',
+                fontSize: 11,
+                fontWeight: 600,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                cursor: 'pointer',
+              }}
+              title="Sair da conta"
+            >
+              <LogOut size={12} /> Sair
+            </button>
+          </div>
         </div>
       </aside>
 
       {/* Main Content */}
       <div className="main-area">
+        {/* SuperAdmin Inspection Banner */}
+        {inspectedTenant && (
+          <div
+            style={{
+              background: '#312E81',
+              color: '#E0E7FF',
+              padding: '8px 16px',
+              fontSize: 12.5,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <ShieldCheck size={16} />
+              <span>
+                <strong>Modo Administrador:</strong> Visualizando o painel do cliente{' '}
+                <strong>{inspectedTenant.name}</strong> ({inspectedTenant.email})
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setInspectedTenantId(null);
+                setInspectedTenant(null);
+              }}
+              style={{
+                background: '#EEF2FF',
+                color: '#1E1B4B',
+                border: 'none',
+                borderRadius: 6,
+                padding: '4px 10px',
+                fontSize: 12,
+                fontWeight: 700,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                cursor: 'pointer',
+              }}
+            >
+              <ArrowLeft size={13} /> Voltar ao Painel Admin
+            </button>
+          </div>
+        )}
+
         {/* Compact Brand Header visible on mobile/tablet */}
         <div className="mobile-brand-bar">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
             <span className="brand-dot" />
             <span className="mobile-brand-name">{settings.name}</span>
           </div>
-          <span className="mobile-brand-hours mono">
-            {settings.openTime}–{settings.closeTime}
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className="mobile-brand-hours mono">
+              {settings.openTime}–{settings.closeTime}
+            </span>
+            <button
+              type="button"
+              onClick={handleLogout}
+              style={{
+                background: 'rgba(239, 68, 68, 0.16)',
+                color: '#FCA5A5',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
+                borderRadius: 6,
+                padding: '3px 7px',
+                fontSize: 11,
+                fontWeight: 600,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+              }}
+            >
+              <LogOut size={12} /> Sair
+            </button>
+          </div>
         </div>
 
         <header className="topbar">
@@ -368,6 +583,14 @@ export function App() {
                 title="Trocar tema ou personalizar dados do salão/barbearia"
               >
                 <Sliders size={14} /> Personalizar Unidade
+              </button>
+
+              <button
+                className="btn btn-sm desktop-only-btn"
+                onClick={handleLogout}
+                title="Encerrar sessão e voltar ao login"
+              >
+                <LogOut size={14} /> Sair
               </button>
             </div>
           </div>

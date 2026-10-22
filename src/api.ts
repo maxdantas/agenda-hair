@@ -1,22 +1,68 @@
 import type {
   Appointment,
+  AuthUser,
   Client,
   CompanySettings,
   ConflictCheckResult,
   FinancialPeriod,
   FinancialReport,
+  LoginResponse,
   NotificationLog,
   PayableAccount,
   PayableRecurrence,
   Product,
   Professional,
+  SaasAdminOverview,
   ServiceItem,
 } from '../shared/types';
 
+const TOKEN_STORAGE_KEY = 'agenda_hair_auth_token';
+const INSPECT_TENANT_KEY = 'agenda_hair_inspect_tenant_id';
+
+export function getStoredToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+export function setStoredToken(token: string | null): void {
+  if (token) {
+    localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } else {
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    localStorage.removeItem(INSPECT_TENANT_KEY);
+  }
+}
+
+export function getInspectedTenantId(): number | null {
+  const val = localStorage.getItem(INSPECT_TENANT_KEY);
+  return val ? Number(val) : null;
+}
+
+export function setInspectedTenantId(tenantId: number | null): void {
+  if (tenantId && tenantId > 0) {
+    localStorage.setItem(INSPECT_TENANT_KEY, String(tenantId));
+  } else {
+    localStorage.removeItem(INSPECT_TENANT_KEY);
+  }
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const token = getStoredToken();
+  const inspectedTenant = getInspectedTenantId();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...((options?.headers as Record<string, string>) || {}),
+  };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  if (inspectedTenant) {
+    headers['x-tenant-id'] = String(inspectedTenant);
+  }
+
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   });
   if (!res.ok) {
     let errMsg = `Erro HTTP ${res.status}`;
@@ -32,6 +78,103 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // Authentication
+  login: (email: string, password: string) =>
+    request<LoginResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  getMe: () => request<{ user: AuthUser }>('/api/auth/me'),
+  logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<{ ok: boolean }>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+
+  // Admin SaaS Panel (SuperAdmin)
+  getAdminOverview: () => request<SaasAdminOverview>('/api/admin/overview'),
+  createTenant: (data: {
+    name: string;
+    ownerName: string;
+    email: string;
+    password: string;
+    phone: string;
+    document: string;
+    businessType: string;
+    planName: string;
+    monthlyFee: number;
+    dueDay: number;
+    status: string;
+    notes?: string;
+  }) =>
+    request<{ id: number }>('/api/admin/tenants', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateTenant: (
+    id: number,
+    data: {
+      name?: string;
+      ownerName?: string;
+      email?: string;
+      newPassword?: string;
+      phone?: string;
+      document?: string;
+      businessType?: string;
+      planName?: string;
+      monthlyFee?: number;
+      dueDay?: number;
+      status?: string;
+      notes?: string;
+    }
+  ) =>
+    request<{ ok: boolean }>(`/api/admin/tenants/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteTenant: (id: number) =>
+    request<{ ok: boolean }>(`/api/admin/tenants/${id}`, { method: 'DELETE' }),
+
+  createSaasPayment: (data: {
+    tenantId: number;
+    referenceMonth: string;
+    amount: number;
+    dueDate: string;
+    status: 'paid' | 'pending';
+    paymentMethod: string;
+    notes?: string;
+  }) =>
+    request<{ id: number }>('/api/admin/payments', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateSaasPayment: (
+    id: number,
+    data: {
+      status?: 'paid' | 'pending' | 'overdue';
+      paymentMethod?: string;
+      paidAt?: string | null;
+      amount?: number;
+      dueDate?: string;
+      notes?: string;
+    }
+  ) =>
+    request<{ ok: boolean }>(`/api/admin/payments/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteSaasPayment: (id: number) =>
+    request<{ ok: boolean }>(`/api/admin/payments/${id}`, { method: 'DELETE' }),
+
+  createAdminStaff: (data: { name: string; email: string; password: string }) =>
+    request<{ id: number }>('/api/admin/staff', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  deleteAdminStaff: (id: number) =>
+    request<{ ok: boolean }>(`/api/admin/staff/${id}`, { method: 'DELETE' }),
+
   // Settings
   getSettings: () => request<CompanySettings>('/api/settings'),
   updateSettings: (data: Partial<CompanySettings>) =>
